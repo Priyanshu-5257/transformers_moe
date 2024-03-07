@@ -26,6 +26,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import functional as F
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -54,7 +55,7 @@ from .configuration_bert import BertConfig
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "google-bert/bert-base-uncased"
+_CHECKPOINT_FOR_DOC = "bert-base-uncased"
 _CONFIG_FOR_DOC = "BertConfig"
 
 # TokenClassification docstring
@@ -78,21 +79,21 @@ _SEQ_CLASS_EXPECTED_LOSS = 0.01
 
 
 BERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "google-bert/bert-base-uncased",
-    "google-bert/bert-large-uncased",
-    "google-bert/bert-base-cased",
-    "google-bert/bert-large-cased",
-    "google-bert/bert-base-multilingual-uncased",
-    "google-bert/bert-base-multilingual-cased",
-    "google-bert/bert-base-chinese",
-    "google-bert/bert-base-german-cased",
-    "google-bert/bert-large-uncased-whole-word-masking",
-    "google-bert/bert-large-cased-whole-word-masking",
-    "google-bert/bert-large-uncased-whole-word-masking-finetuned-squad",
-    "google-bert/bert-large-cased-whole-word-masking-finetuned-squad",
-    "google-bert/bert-base-cased-finetuned-mrpc",
-    "google-bert/bert-base-german-dbmdz-cased",
-    "google-bert/bert-base-german-dbmdz-uncased",
+    "bert-base-uncased",
+    "bert-large-uncased",
+    "bert-base-cased",
+    "bert-large-cased",
+    "bert-base-multilingual-uncased",
+    "bert-base-multilingual-cased",
+    "bert-base-chinese",
+    "bert-base-german-cased",
+    "bert-large-uncased-whole-word-masking",
+    "bert-large-cased-whole-word-masking",
+    "bert-large-uncased-whole-word-masking-finetuned-squad",
+    "bert-large-cased-whole-word-masking-finetuned-squad",
+    "bert-base-cased-finetuned-mrpc",
+    "bert-base-german-dbmdz-cased",
+    "bert-base-german-dbmdz-uncased",
     "cl-tohoku/bert-base-japanese",
     "cl-tohoku/bert-base-japanese-whole-word-masking",
     "cl-tohoku/bert-base-japanese-char",
@@ -452,7 +453,7 @@ class BertIntermediate(nn.Module):
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
-
+    
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -466,9 +467,80 @@ class BertOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
+class NoisyTopkRouter(nn.Module):
+    def __init__(self, n_embed, num_experts, top_k):
+        super(NoisyTopkRouter, self).__init__()
+        self.top_k = top_k
+        #layer for router logits
+        self.topkroute_linear = nn.Linear(n_embed, num_experts)
+        self.noise_linear =nn.Linear(n_embed, num_experts)
+
+    
+    def forward(self, mh_output):
+        # mh_ouput is the output tensor from multihead self attention block
+        logits = self.topkroute_linear(mh_output)
+
+        #Noise logits
+        noise_logits = self.noise_linear(mh_output)
+
+        #Adding scaled unit gaussian noise to the logits
+        noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        noisy_logits = logits + noise
+
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = F.softmax(sparse_logits, dim=-1)
+        return router_output, indices
+
+class SparseMoE(nn.Module):
+    def __init__(self,config, expert: nn.Module, gate: nn.Module):
+        super(SparseMoE, self).__init__()
+        self.router = gate
+        self.experts = nn.ModuleList([expert for _ in range(5)])
+        self.top_k = 2
+        self.intermediate_size = config.intermediate_size
+
+    def forward(self, x):
+        gating_output, indices = self.router(x)
+        final_output = torch.zeros([x.shape[0], x.shape[1], self.intermediate_size]).to(x.device)
+
+        # Reshape inputs for batch processing
+        flat_x = x.view(-1, x.size(-1))
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+        # Process each expert in parallel
+        for i, expert in enumerate(self.experts):
+            # Create a mask for the inputs where the current expert is in top-k
+            expert_mask = (indices == i).any(dim=-1)
+            flat_mask = expert_mask.view(-1)
+
+            if flat_mask.any():
+                expert_input = flat_x[flat_mask]
+                expert_output = expert(expert_input)
+
+                # Extract and apply gating scores
+                gating_scores = flat_gating_output[flat_mask, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+
+                # Update final output additively by indexing and adding
+                final_output[expert_mask] += weighted_output.squeeze(1)
+        return final_output
+
+# class Moe_block(nn.Module):
+#     def __init__(self,hidden_size):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(hidden_size, 3*hidden_size),
+#             nn.ReLU(),
+#             nn.Linear(hidden_size*3, hidden_size),
+#             nn.Dropout(0.1),
+#         )
+#     def forward(self, x):
+#         return self.net(x)
+
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,moe=False):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
@@ -479,7 +551,12 @@ class BertLayer(nn.Module):
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(config, position_embedding_type="absolute")
-        self.intermediate = BertIntermediate(config)
+        
+        self.moe = moe 
+        if self.moe :
+            self.intermediate = SparseMoE(config,BertIntermediate(config), NoisyTopkRouter(config.hidden_size,5, 2))
+        if not self.moe:
+            self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
     def forward(
@@ -554,10 +631,11 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,moe=False):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.moe = moe
+        self.layer = nn.ModuleList([BertLayer(config,moe=self.moe) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -875,12 +953,12 @@ class BertModel(BertPreTrainedModel):
     `add_cross_attention` set to `True`; an `encoder_hidden_states` is then expected as an input to the forward pass.
     """
 
-    def __init__(self, config, add_pooling_layer=True):
+    def __init__(self, config, add_pooling_layer=True,moe=False):
         super().__init__(config)
         self.config = config
-
+        self.moe = moe
         self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
+        self.encoder = BertEncoder(config,moe=self.moe)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
@@ -1101,8 +1179,8 @@ class BertForPreTraining(BertPreTrainedModel):
         >>> from transformers import AutoTokenizer, BertForPreTraining
         >>> import torch
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
-        >>> model = BertForPreTraining.from_pretrained("google-bert/bert-base-uncased")
+        >>> tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        >>> model = BertForPreTraining.from_pretrained("bert-base-uncased")
 
         >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
         >>> outputs = model(**inputs)
@@ -1453,8 +1531,8 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
         >>> from transformers import AutoTokenizer, BertForNextSentencePrediction
         >>> import torch
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
-        >>> model = BertForNextSentencePrediction.from_pretrained("google-bert/bert-base-uncased")
+        >>> tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        >>> model = BertForNextSentencePrediction.from_pretrained("bert-base-uncased")
 
         >>> prompt = "In Italy, pizza served in formal settings, such as at a restaurant, is presented unsliced."
         >>> next_sentence = "The sky is blue due to the shorter wavelength of blue light."
