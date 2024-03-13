@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
@@ -345,8 +346,68 @@ class T5LayerFF(nn.Module):
         return hidden_states
 
 
+class NoisyTopkRouter(nn.Module):
+    def __init__(self, n_embed, num_experts, top_k):
+        super(NoisyTopkRouter, self).__init__()
+        self.top_k = top_k
+        #layer for router logits
+        self.topkroute_linear = nn.Linear(n_embed, num_experts)
+        self.noise_linear =nn.Linear(n_embed, num_experts)
+
+    
+    def forward(self, mh_output):
+        # mh_ouput is the output tensor from multihead self attention block
+        logits = self.topkroute_linear(mh_output)
+
+        #Noise logits
+        noise_logits = self.noise_linear(mh_output)
+
+        #Adding scaled unit gaussian noise to the logits
+        noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        noisy_logits = logits + noise
+
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = F.softmax(sparse_logits, dim=-1)
+        return router_output, indices
+
+class SparseMoE(nn.Module):
+    def __init__(self,intermediate_size, expert: nn.Module, gate: nn.Module):
+        super(SparseMoE, self).__init__()
+        self.router = gate
+        self.experts = nn.ModuleList([expert for _ in range(5)])
+        self.top_k = 2
+        self.intermediate_size = intermediate_size
+
+    def forward(self, x):
+        gating_output, indices = self.router(x)
+        final_output = torch.zeros([x.shape[0], x.shape[1], self.intermediate_size]).to(x.device)
+
+        # Reshape inputs for batch processing
+        flat_x = x.view(-1, x.size(-1))
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+        # Process each expert in parallel
+        for i, expert in enumerate(self.experts):
+            # Create a mask for the inputs where the current expert is in top-k
+            expert_mask = (indices == i).any(dim=-1)
+            flat_mask = expert_mask.view(-1)
+
+            if flat_mask.any():
+                expert_input = flat_x[flat_mask]
+                expert_output = expert(expert_input)
+
+                # Extract and apply gating scores
+                gating_scores = flat_gating_output[flat_mask, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+
+                # Update final output additively by indexing and adding
+                final_output[expert_mask] += weighted_output.squeeze(1)
+        return final_output
+    
+
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+    def __init__(self, config: T5Config,fuckit=False, has_relative_attention_bias=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
@@ -359,8 +420,11 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.p = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        if fuckit is False:
+            self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        if fuckit is True:
+            self.q = SparseMoE(self.inner_dim, nn.Linear(self.d_model, self.inner_dim, bias=False), NoisyTopkRouter(self.d_model,5, 2))
+        #self.p = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
@@ -378,7 +442,7 @@ class T5Attention(nn.Module):
         )
         # Prune linear layers
         self.q = prune_linear_layer(self.q, index)
-        self.p = prune_linear_layer(self.q, index)
+        #self.p = prune_linear_layer(self.p, index)
 
         self.k = prune_linear_layer(self.k, index)
         self.v = prune_linear_layer(self.v, index)
@@ -521,8 +585,8 @@ class T5Attention(nn.Module):
 
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
-        puery_states = shape(self.p(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
-
+        #puery_states = shape(self.p(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+        
         # get key/value states
         key_states = project(
             hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
@@ -536,10 +600,10 @@ class T5Attention(nn.Module):
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
-        scores_p = torch.matmul(
-            puery_states, value_states.transpose(3, 2)
-        )
-        scores += scores_p
+        # scores_p = torch.matmul(
+        #     puery_states, value_states.transpose(3, 2)
+        # )
+        # scores += scores_p
 
         if position_bias is None:
             if not self.has_relative_attention_bias:
@@ -590,9 +654,9 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config,fuckit=False, has_relative_attention_bias=False):
         super().__init__()
-        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
+        self.SelfAttention = T5Attention(config,fuckit=fuckit, has_relative_attention_bias=has_relative_attention_bias)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -622,9 +686,9 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerCrossAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,fuckit=False):
         super().__init__()
-        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False)
+        self.EncDecAttention = T5Attention(config,fuckit=fuckit, has_relative_attention_bias=False)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -681,12 +745,12 @@ class T5Block(nn.Module):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.fuckit = fuckit
-        if self.fuckit == True:
-            self.knowledge_block = KnowledgeBlock(config)
+        # if self.fuckit == True:
+        #     self.knowledge_block = KnowledgeBlock(config)
         self.layer = nn.ModuleList()
-        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
+        self.layer.append(T5LayerSelfAttention(config,fuckit=fuckit, has_relative_attention_bias=has_relative_attention_bias))
         if self.is_decoder:
-            self.layer.append(T5LayerCrossAttention(config))
+            self.layer.append(T5LayerCrossAttention(config,fuckit=fuckit))
 
         self.layer.append(T5LayerFF(config))
         
@@ -903,7 +967,12 @@ class T5PreTrainedModel(PreTrainedModel):
             d_model = self.config.d_model
             key_value_proj_dim = self.config.d_kv
             n_heads = self.config.num_heads
-            module.q.weight.data.normal_(mean=0.0, std=factor * ((d_model * key_value_proj_dim) ** -0.5))
+
+            try:
+                for expert in module.q.experts:
+                    expert.weight.data.normal_(mean=0.0, std=factor * ((d_model * key_value_proj_dim) ** -0.5))
+            except:
+                module.q.weight.data.normal_(mean=0.0, std=factor * ((d_model * key_value_proj_dim) ** -0.5))
             module.k.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
             module.v.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
             module.o.weight.data.normal_(mean=0.0, std=factor * ((n_heads * key_value_proj_dim) ** -0.5))
