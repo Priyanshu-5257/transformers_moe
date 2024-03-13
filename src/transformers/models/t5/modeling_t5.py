@@ -861,8 +861,8 @@ class T5Block(nn.Module):
                 torch.finfo(hidden_states.dtype).max,
             )
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-        if self.fuckit == True :
-            hidden_states  += knowledge_outputs[0]
+        # if self.fuckit == True :
+        #     hidden_states  += knowledge_outputs[0]
         outputs = (hidden_states,)
 
         if use_cache:
