@@ -360,6 +360,7 @@ class T5Attention(nn.Module):
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.p = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
@@ -377,6 +378,8 @@ class T5Attention(nn.Module):
         )
         # Prune linear layers
         self.q = prune_linear_layer(self.q, index)
+        self.p = prune_linear_layer(self.q, index)
+
         self.k = prune_linear_layer(self.k, index)
         self.v = prune_linear_layer(self.v, index)
         self.o = prune_linear_layer(self.o, index, dim=1)
@@ -518,6 +521,7 @@ class T5Attention(nn.Module):
 
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+        puery_states = shape(self.p(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
         # get key/value states
         key_states = project(
@@ -531,6 +535,11 @@ class T5Attention(nn.Module):
         scores = torch.matmul(
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+
+        scores_p = torch.matmul(
+            puery_states, value_states.transpose(3, 2)
+        )
+        scores += scores_p
 
         if position_bias is None:
             if not self.has_relative_attention_bias:
