@@ -33,7 +33,6 @@ from ...modeling_outputs import (
     Seq2SeqModelOutput,
     Seq2SeqQuestionAnsweringModelOutput,
     Seq2SeqSequenceClassifierOutput,
-    TokenClassifierOutput,
 )
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS, find_pruneable_heads_and_indices, prune_linear_layer
@@ -53,18 +52,18 @@ from .configuration_t5 import T5Config
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "T5Config"
-_CHECKPOINT_FOR_DOC = "google-t5/t5-small"
+_CHECKPOINT_FOR_DOC = "t5-small"
 
 ####################################################
 # This dict contains ids and associated url
 # for the pretrained weights provided with the models
 ####################################################
 T5_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "google-t5/t5-small",
-    "google-t5/t5-base",
-    "google-t5/t5-large",
-    "google-t5/t5-3b",
-    "google-t5/t5-11b",
+    "t5-small",
+    "t5-base",
+    "t5-large",
+    "t5-3b",
+    "t5-11b",
     # See all T5 models at https://huggingface.co/models?filter=t5
 ]
 
@@ -196,17 +195,17 @@ PARALLELIZE_DOCSTRING = r"""
             have fewer attention modules mapped to it than other devices. For reference, the t5 models have the
             following number of attention modules:
 
-                - google-t5/t5-small: 6
-                - google-t5/t5-base: 12
-                - google-t5/t5-large: 24
-                - google-t5/t5-3b: 24
-                - google-t5/t5-11b: 24
+                - t5-small: 6
+                - t5-base: 12
+                - t5-large: 24
+                - t5-3b: 24
+                - t5-11b: 24
 
     Example:
 
     ```python
-    # Here is an example of a device map on a machine with 4 GPUs using google-t5/t5-3b, which has a total of 24 attention modules:
-    model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-3b")
+    # Here is an example of a device map on a machine with 4 GPUs using t5-3b, which has a total of 24 attention modules:
+    model = T5ForConditionalGeneration.from_pretrained("t5-3b")
     device_map = {
         0: [0, 1, 2],
         1: [3, 4, 5, 6, 7, 8, 9],
@@ -222,8 +221,8 @@ DEPARALLELIZE_DOCSTRING = r"""
     Example:
 
     ```python
-    # On a 4 GPU machine with google-t5/t5-3b:
-    model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-3b")
+    # On a 4 GPU machine with t5-3b:
+    model = T5ForConditionalGeneration.from_pretrained("t5-3b")
     device_map = {
         0: [0, 1, 2],
         1: [3, 4, 5, 6, 7, 8, 9],
@@ -648,18 +647,58 @@ class T5LayerCrossAttention(nn.Module):
         outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
         return outputs
 
+class KnowledgeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.linear = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.linear2 = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.knowledge_attention = T5Attention(config, has_relative_attention_bias=False)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_bias=None,
+        layer_head_mask=None,
+        past_key_value=None,
+        use_cache=False,
+        output_attentions=False,
+    ):
+
+        hidden_states = self.linear(hidden_states)
+        hidden_states = self.linear2(hidden_states)
+        normed_hidden_states = self.layer_norm(hidden_states)
+        if past_key_value is not None: 
+            past_key_value = past_key_value[:2]
+        attention_output = self.knowledge_attention(
+            normed_hidden_states,
+            mask=attention_mask,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+        )
+        hidden_states = hidden_states + self.dropout(attention_output[0])
+        outputs = (hidden_states,) + attention_output[1:]
+        return outputs
 
 class T5Block(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False,fuckit=False):
         super().__init__()
         self.is_decoder = config.is_decoder
+        self.fuckit = fuckit
+        if self.fuckit == True:
+            self.knowledge_block = KnowledgeBlock(config)
         self.layer = nn.ModuleList()
         self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
 
         self.layer.append(T5LayerFF(config))
-
+        
     def forward(
         self,
         hidden_states,
@@ -674,7 +713,18 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
-    ):
+    ):  
+        if self.fuckit == True :
+            knowledge_outputs = self.knowledge_block(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_bias=position_bias,
+                layer_head_mask=layer_head_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+
         if past_key_value is not None:
             if not self.is_decoder:
                 logger.warning("`past_key_values` is passed to the encoder. Please make sure this is intended.")
@@ -769,6 +819,8 @@ class T5Block(nn.Module):
             outputs = outputs + (present_key_value_state,) + attention_outputs
         else:
             outputs = outputs + attention_outputs
+        if self.fuckit == True :
+            outputs = knowledge_outputs + outputs
 
         return outputs  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
 
@@ -833,10 +885,6 @@ class T5PreTrainedModel(PreTrainedModel):
             if hasattr(module, "qa_outputs"):
                 module.qa_outputs.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
                 module.qa_outputs.bias.data.zero_()
-        elif isinstance(module, T5ForTokenClassification):
-            if hasattr(module, "classifier"):
-                module.classifier.weight.data.normal_(mean=0.0, std=factor * 1.0)
-                module.classifier.bias.data.zero_()
         elif isinstance(module, T5ClassificationHead):
             module.dense.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.dense, "bias") and module.dense.bias is not None:
@@ -906,14 +954,14 @@ class T5PreTrainedModel(PreTrainedModel):
 
 
 class T5Stack(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None,fuckit=False):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, has_relative_attention_bias=bool(i == 0),fuckit=fuckit) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -1352,21 +1400,20 @@ class T5Model(T5PreTrainedModel):
     ]
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
 
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config,fuckit=False):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
-
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared,fuckit=fuckit)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared,fuckit=fuckit)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1463,8 +1510,8 @@ class T5Model(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5Model
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5Model.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5Model.from_pretrained("t5-small")
 
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
@@ -1557,17 +1604,17 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
     ]
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
 
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config, fuckit=False):
         super().__init__(config)
         self.model_dim = config.d_model
-
+        self.fuckit=fuckit
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared,fuckit=self.fuckit)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
@@ -1678,8 +1725,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5ForConditionalGeneration
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5ForConditionalGeneration.from_pretrained("t5-small")
 
         >>> # training
         >>> input_ids = tokenizer("The <extra_id_0> walks in <extra_id_1> park", return_tensors="pt").input_ids
@@ -1967,8 +2014,8 @@ class T5EncoderModel(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5EncoderModel
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5EncoderModel.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5EncoderModel.from_pretrained("t5-small")
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
         ... ).input_ids  # Batch size 1
@@ -2120,78 +2167,6 @@ class T5ForSequenceClassification(T5PreTrainedModel):
             encoder_last_hidden_state=outputs.encoder_last_hidden_state,
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    T5 Encoder Model with a token classification head on top (a linear layer on top of the hidden-states output)
-    e.g. for Named-Entity-Recognition (NER) tasks.
-    """,
-    T5_START_DOCSTRING,
-)
-class T5ForTokenClassification(T5PreTrainedModel):
-    _tied_weights_keys = ["transformer.encoder.embed_tokens.weight"]
-
-    def __init__(self, config: T5Config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-
-        self.transformer = T5EncoderModel(config)
-        self.dropout = nn.Dropout(config.classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(T5_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=TokenClassifierOutput, config_class=_CONFIG_FOR_DOC)
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
-        Returns:
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = outputs[0]
-        hidden_states = self.dropout(hidden_states)
-        logits = self.classifier(hidden_states)
-
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-        if not return_dict:
-            output = (logits, outputs[2:-1])
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
         )
 
 
