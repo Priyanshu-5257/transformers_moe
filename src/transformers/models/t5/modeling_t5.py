@@ -650,39 +650,21 @@ class T5LayerCrossAttention(nn.Module):
 class KnowledgeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.linear = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.linear2 = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.knowledge_attention = T5Attention(config, has_relative_attention_bias=False)
+        self.linear = nn.Linear(config.d_model, config.d_model)
+        self.linear2 = nn.Linear(config.d_model, config.d_model)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
     def forward(
         self,
         hidden_states,
-        attention_mask=None,
-        position_bias=None,
-        layer_head_mask=None,
-        past_key_value=None,
-        use_cache=False,
-        output_attentions=False,
     ):
-
-        hidden_states = self.linear(hidden_states)
-        hidden_states = self.linear2(hidden_states)
-        normed_hidden_states = self.layer_norm(hidden_states)
-        if past_key_value is not None: 
-            past_key_value = past_key_value[:2]
-        attention_output = self.knowledge_attention(
-            normed_hidden_states,
-            mask=attention_mask,
-            position_bias=position_bias,
-            layer_head_mask=layer_head_mask,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
-        hidden_states = hidden_states + self.dropout(attention_output[0])
-        outputs = (hidden_states,) + attention_output[1:]
+        hidden_states = self.layer_norm(hidden_states)
+        knowledge_hidden_states = self.linear(hidden_states)
+        knowledge_hidden_states = self.linear2(knowledge_hidden_states)
+        knowledge_hidden_states = self.layer_norm(knowledge_hidden_states)
+        hidden_states = hidden_states
+        outputs = (hidden_states,)
         return outputs
 
 class T5Block(nn.Module):
@@ -717,12 +699,6 @@ class T5Block(nn.Module):
         if self.fuckit == True :
             knowledge_outputs = self.knowledge_block(
                 hidden_states,
-                attention_mask=attention_mask,
-                position_bias=position_bias,
-                layer_head_mask=layer_head_mask,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
             )
 
         if past_key_value is not None:
@@ -812,15 +788,15 @@ class T5Block(nn.Module):
                 torch.finfo(hidden_states.dtype).max,
             )
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-
+        if self.fuckit == True :
+            hidden_states  += knowledge_outputs[0]
         outputs = (hidden_states,)
 
         if use_cache:
             outputs = outputs + (present_key_value_state,) + attention_outputs
         else:
             outputs = outputs + attention_outputs
-        if self.fuckit == True :
-            outputs = knowledge_outputs + outputs
+        
 
         return outputs  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
 
