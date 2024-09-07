@@ -1,4 +1,4 @@
-This repo is forked from orginsl transformers repo
+This repo is forked from orginal transformers repo
 ### Modifications :
 - It has modified bert model with mixture experts layers
 - Instead of using mixture of experts over transformer head, we have used it in MLP layer within the each head
