@@ -1765,6 +1765,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        image_features: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1861,7 +1862,10 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = decoder_outputs[0]
+        if image_features is not None:
+            sequence_output = decoder_outputs[0] + image_features.unsqueeze(1).repeat(1, decoder_outputs[0].shape[1], 1)
+        else :
+            sequence_output = decoder_outputs[0]
 
         # Set device for model parallelism
         if self.model_parallel:
