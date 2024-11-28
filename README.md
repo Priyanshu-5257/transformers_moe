@@ -20,7 +20,7 @@ model = BertModel(config=config,moe = True)
 In this example notebook[https://www.kaggle.com/code/hbpkillerx/moe-bert-1], I used the sentence-transformers/all-MiniLM-L6-v2 as the base model configuration and then created the MoE-BERT model. To speed up the training process, I copied the weights from the original model’s layers and froze them during training. This way, only the newly introduced MoE layers are trained during fine-tuning, which significantly reduces the computational cost and training time.
 
 ## Traning Results 
-<iframe src="https://wandb.ai/hbpkillerx/bert-moe-mlp/reports/Modifying-BERT-with-Mixture-of-MLP-Experts--VmlldzoxMDM4MDc0OQ" style="border:none;height:1024px;width:100%">
+[[https://api.wandb.ai/links/hbpkillerx/misvgem5]]
 
 ### Changes made in 'src/transformers/models/bert/modeling_bert.py'
 
