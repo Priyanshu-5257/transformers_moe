@@ -16,3 +16,5 @@ config = model_.config
 from transformers import BertModel, BertTokenizer
 model = BertModel(config=config,moe = True)
 ```
+### Example 
+Kaggle Notebook Link[https://www.kaggle.com/code/hbpkillerx/moe-bert-1]
