@@ -17,11 +17,10 @@ from transformers import BertModel, BertTokenizer
 model = BertModel(config=config,moe = True)
 ```
 ### Example 
-Kaggle Notebook Link[https://www.kaggle.com/code/hbpkillerx/moe-bert-1]
-In this example notebook i used 'sentence-transformers/all-MiniLM-L6-v2' as base model config and then create the moe-bert, 
-for faster training i copied the weights of the old layers from the original model. And keep it freeze while training. Only the introduced moe-layers are trained during finetuning. 
+In this example notebook[https://www.kaggle.com/code/hbpkillerx/moe-bert-1], I used the sentence-transformers/all-MiniLM-L6-v2 as the base model configuration and then created the MoE-BERT model. To speed up the training process, I copied the weights from the original model’s layers and froze them during training. This way, only the newly introduced MoE layers are trained during fine-tuning, which significantly reduces the computational cost and training time.
 
-### Changes made 
+### Changes made in 'src/transformers/models/bert/modeling_bert.py'
+
 
 ```python
 class TopkRouter(nn.Module):
